@@ -1,0 +1,7 @@
+.env
+*.db
+*.pyc
+__pycache__/
+gemini_usage.log
+logs.json
+*.json
