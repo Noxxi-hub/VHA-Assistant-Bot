@@ -43,12 +43,31 @@ LOGO_URL = (
     "?ex=6a328191&is=6a313011&hm=72f5b3e3960a3ad8637eeb59e07cca15bc4ce08d9f506e8b72a61d5297cc9bb7&"
 )
 
+# ── Modell-Priorität: Primär (günstig) → Notfall (teurer) ──
+# 3.1-flash-lite ist NOTFALLSCHALTER nur bei 503 der Primär-Modelle
 GEMINI_MODELS = [
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-3-flash-preview",
+    "gemini-2.5-flash",          # Primär
+    "gemini-2.5-flash-lite",     # Primär (leichter)
 ]
+GEMINI_FALLBACK_MODEL = "gemini-3.1-flash-lite"  # Notfall (teurer, nur bei 503)
+
 GEMINI_MODEL = GEMINI_MODELS[0]  # für Kompatibilität
+
+# ── Fallback-Tracking ──
+fallback_active = False
+fallback_since: float = 0.0
+_fallback_check_interval = 600  # 10 Minuten
+_last_fallback_check: float = 0.0
+
+# ── Modell-Nutzungs-Statistik ──
+model_usage: dict[str, int] = {}  # model_name → anzahl_calls
+
+# ── Preis-Tabelle (pro 1M Tokens) ──
+MODEL_PRICING = {
+    "gemini-2.5-flash":       {"input": 0.10, "output": 0.40},
+    "gemini-2.5-flash-lite": {"input": 0.10, "output": 0.40},
+    "gemini-3.1-flash-lite": {"input": 0.15, "output": 0.60},
+}
 BOT_LOG_CHANNEL_ID = 1498221186025259108
 
 # ────────────────────────────────────────────────
@@ -108,18 +127,14 @@ def ping():
 
 
 # ────────────────────────────────────────────────
-# GEMINI ASYNC WRAPPER mit Retry
+# GEMINI ASYNC WRAPPER mit priorisiertem Fallback
 # ────────────────────────────────────────────────
 
-async def gemini_call(model: str, messages: list, temperature: float = 0.1,
-                      max_tokens: int = 500, retries: int = 3) -> str:
-    """
-    Führt einen Gemini-API-Call asynchron aus mit automatischem Modell-Fallback.
-    messages: OpenAI-kompatibles Format [{"role": "system"/"user", "content": "..."}]
-    """
+async def _try_model(model_name: str, messages: list, temperature: float,
+                      max_tokens: int, retries: int = 3) -> str:
+    """Versucht ein einzelnes Modell mit Retries. Returns text bei Erfolg, raises bei Fehler."""
     loop = asyncio.get_event_loop()
 
-    # System-Prompt und User-Messages trennen
     system_text = None
     contents = []
     for msg in messages:
@@ -129,10 +144,7 @@ async def gemini_call(model: str, messages: list, temperature: float = 0.1,
             system_text = content
         elif role == "user":
             if isinstance(content, str):
-                contents.append(types.Content(
-                    role="user",
-                    parts=[types.Part(text=content)]
-                ))
+                contents.append(types.Content(role="user", parts=[types.Part(text=content)]))
             elif isinstance(content, list):
                 parts = []
                 for item in content:
@@ -145,66 +157,130 @@ async def gemini_call(model: str, messages: list, temperature: float = 0.1,
                             mime = header.split(":")[1].split(";")[0]
                             import base64 as _b64
                             raw = _b64.b64decode(b64data)
-                            parts.append(types.Part(
-                                inline_data=types.Blob(mime_type=mime, data=raw)
-                            ))
+                            parts.append(types.Part(inline_data=types.Blob(mime_type=mime, data=raw)))
                         else:
                             parts.append(types.Part(text=f"[Image URL: {url}]"))
                 contents.append(types.Content(role="user", parts=parts))
 
-    # Fallback-Kette durchprobieren
+    use_thinking = "2.5" in model_name
+    config = types.GenerateContentConfig(
+        temperature=temperature,
+        max_output_tokens=max_tokens,
+        system_instruction=system_text,
+        thinking_config=types.ThinkingConfig(thinking_budget=0) if use_thinking else None,
+    )
+
+    wait = 1
+    for attempt in range(retries):
+        async with gemini_semaphore:
+            try:
+                resp = await loop.run_in_executor(
+                    None,
+                    lambda m=model_name, c=contents, cfg=config: gemini_client.models.generate_content(
+                        model=m, contents=c, config=cfg,
+                    )
+                )
+                if resp.usage_metadata:
+                    total = (resp.usage_metadata.prompt_token_count or 0) + (resp.usage_metadata.candidates_token_count or 0)
+                    token_counter["prompt"]     += resp.usage_metadata.prompt_token_count or 0
+                    token_counter["completion"] += resp.usage_metadata.candidates_token_count or 0
+                    token_counter["total"]      += total
+                    log.info(f"Tokens: +{total} (heute gesamt: {token_counter['total']})")
+
+                model_usage[model_name] = model_usage.get(model_name, 0) + 1
+                return resp.text.strip()
+
+            except Exception as e:
+                err = str(e).lower()
+                if "429" in err or "quota" in err or "resource_exhausted" in err or "rate" in err:
+                    log.warning(f"⚠️  RATE-LIMIT {model_name} (Versuch {attempt+1}/{retries}) — warte {wait}s...")
+                    await asyncio.sleep(wait)
+                    wait = min(wait * 2, 10)
+                elif "503" in err or "500" in err or "502" in err or "unavailable" in err or "server" in err:
+                    raise  # 503 direkt weiter oben behandeln
+                else:
+                    log.error(f"❌ GEMINI-FEHLER {model_name}: {type(e).__name__}: {e}")
+                    raise
+
+    raise Exception(f"{model_name} nach {retries} Versuchen fehlgeschlagen")
+
+
+async def _check_fallback_reset():
+    """Prüft ob Primär-Modelle wieder verfügbar sind (alle 10 Min)."""
+    global fallback_active, fallback_since, _last_fallback_check
+
+    now = time.time()
+    if not fallback_active:
+        return
+    if now - _last_fallback_check < _fallback_check_interval:
+        return
+
+    _last_fallback_check = now
+    log.info("🔍 PRÜFE: Primär-Modelle wieder verfügbar?")
+
+    try:
+        test_messages = [
+            {"role": "system", "content": "Reply with exactly: OK"},
+            {"role": "user", "content": "test"}
+        ]
+        result = await _try_model("gemini-2.5-flash-lite", test_messages, 0.1, 50, retries=1)
+        if result:
+            fallback_active = False
+            fallback_since = 0.0
+            log.info("✅ PRIMÄR-MODELLE WIEDER VERFÜGABAR — zurück zu günstigen Modellen")
+    except Exception:
+        fallback_since = now
+        log.info("⏳ Primär-Modelle immer noch nicht verfügbar — bleibe auf 3.1er")
+
+
+async def gemini_call(model: str, messages: list, temperature: float = 0.1,
+                      max_tokens: int = 500, retries: int = 3) -> str:
+    """Priorisiertes Fallback-System: Primär (günstig) → Notfall (teurer) → Fehler."""
+    global fallback_active, fallback_since
+
+    # 1. Versuch Primär-Modelle
     last_error = None
     for model_name in GEMINI_MODELS:
-        # thinking_config nur bei 2.5-Modellen (3.x hat es eingebaut)
-        use_thinking = "2.5" in model_name
-        config = types.GenerateContentConfig(
-            temperature=temperature,
-            max_output_tokens=max_tokens,
-            system_instruction=system_text,
-            thinking_config=types.ThinkingConfig(thinking_budget=0) if use_thinking else None,
-        )
+        try:
+            result = await _try_model(model_name, messages, temperature, max_tokens, retries=2)
+            if model_name != GEMINI_MODELS[0]:
+                log.info(f"FALLBACK OK → {model_name}")
 
-        wait = 4
-        for attempt in range(retries):
-            async with gemini_semaphore:
-                try:
-                    resp = await loop.run_in_executor(
-                        None,
-                        lambda m=model_name, c=contents, cfg=config: gemini_client.models.generate_content(
-                            model=m,
-                            contents=c,
-                            config=cfg,
-                        )
-                    )
-                    if resp.usage_metadata:
-                        total = (resp.usage_metadata.prompt_token_count or 0) + \
-                                (resp.usage_metadata.candidates_token_count or 0)
-                        token_counter["prompt"]     += resp.usage_metadata.prompt_token_count or 0
-                        token_counter["completion"] += resp.usage_metadata.candidates_token_count or 0
-                        token_counter["total"]      += total
-                        log.info(f"Tokens: +{total} (heute gesamt: {token_counter['total']})")
-                    
-                    if model_name != GEMINI_MODELS[0]:
-                        log.info(f"FALLBACK OK → {model_name}")
-                    return resp.text.strip()
+            if fallback_active:
+                await _check_fallback_reset()
 
-                except Exception as e:
-                    err = str(e)
-                    last_error = err
-                    if "429" in err or "quota" in err.lower() or "rate" in err.lower():
-                        log.warning(f"{model_name} Rate-Limit (Versuch {attempt+1}/{retries}) – warte {wait}s")
-                        await asyncio.sleep(wait)
-                        wait = min(wait * 2, 60)
-                    elif "503" in err or "500" in err or "502" in err or "unavailable" in err.lower() or "server" in err.lower():
-                        log.warning(f"{model_name} überlastet ({err[:50]}), versuche nächstes Modell...")
-                        break  # sofort nächstes Modell
-                    else:
-                        log.error(f"Gemini-Fehler {model_name}: {e}")
-                        break
+            return result
+        except Exception as e:
+            err = str(e).lower()
+            last_error = str(e)
+            if "503" in err or "500" in err or "502" in err or "unavailable" in err:
+                log.warning(f"⚠️  SERVER-FEHLER {model_name} — 503 erkannt")
+            else:
+                log.warning(f"⚠️  {model_name} fehlgeschlagen: {type(e).__name__}")
 
-        log.warning(f"Modell {model_name} fehlgeschlagen, fallback...")
+    # 2. Alle Primär-Modelle gescheitert → Fallback auf 3.1-flash-lite
+    if not fallback_active:
+        fallback_active = True
+        fallback_since = time.time()
+        log.warning(f"🚨 ALLE PRIMÄR-MODELLE DOWN → NOTFALL: {GEMINI_FALLBACK_MODEL}")
 
-    raise Exception(f"Alle Gemini-Modelle down. Letzter Fehler: {last_error}")
+    try:
+        result = await _try_model(GEMINI_FALLBACK_MODEL, messages, temperature, max_tokens, retries)
+        log.info(f"✅ NOTFALL OK → {GEMINI_FALLBACK_MODEL}")
+
+        await _check_fallback_reset()
+        return result
+    except Exception as e:
+        last_error = str(e)
+        log.error(f"❌ AUCH NOTFALL DOWN: {GEMINI_FALLBACK_MODEL}: {last_error}")
+
+        usage_31 = model_usage.get(GEMINI_FALLBACK_MODEL, 0)
+        total_usage = sum(model_usage.values()) or 1
+        pct_31 = (usage_31 / total_usage) * 100
+        if pct_31 > 20 and usage_31 > 10:
+            log.error(f"🚨 ALARM: 3.1-Flash-Lite Anteil {pct_31:.0f}% — Google-Problem andauert!")
+
+        raise Exception(f"Alle Gemini-Modelle down (inkl. Notfall). Letzter Fehler: {last_error}")
 
 
 async def gemini_call_thinking(model: str, messages: list, temperature: float = 0.7,
@@ -726,7 +802,7 @@ async def cmd_help(ctx):
     embed.add_field(
         name="🏗️ Server-Struktur  🔐 Bot DEV",
         value=(
-            "`!server export` – Aktuelle Struktur in MongoDB speichern\n"
+            "`!server export` – Aktuelle Struktur speichern\n"
             "`!server preview` – Gespeicherte Struktur anzeigen\n"
             "`!server import` – Struktur auf neuem Server erstellen"
         ),
@@ -815,73 +891,6 @@ async def translate_error(ctx, error):
         await ctx.send("❌ Du hast keine Berechtigung dafür. / Tu n'as pas la permission.")
 
 
-# ────────────────────────────────────────────────
-# KI-Gedächtnis — MongoDB
-# ────────────────────────────────────────────────
-
-_ai_memory_client = None
-
-def get_ai_memory_col():
-    global _ai_memory_client
-    if _ai_memory_client is None:
-        _ai_memory_client = MongoClient(os.getenv("MONGODB_URI"))
-    return _ai_memory_client["vhabot"]["ai_memory"]
-
-def load_history(user_id: int) -> list:
-    try:
-        col = get_ai_memory_col()
-        doc = col.find_one({"_id": str(user_id)})
-        if doc:
-            return doc.get("history", [])
-    except Exception:
-        pass
-    return []
-
-def save_history(user_id: int, history: list):
-    try:
-        col = get_ai_memory_col()
-        history = history[-8:]
-        col.update_one(
-            {"_id": str(user_id)},
-            {"$set": {"history": history}},
-            upsert=True
-        )
-    except Exception as e:
-        log.error(f"AI Memory Fehler: {e}")
-
-def clear_history(user_id: int):
-    try:
-        col = get_ai_memory_col()
-        col.delete_one({"_id": str(user_id)})
-    except Exception:
-        pass
-
-def build_messages(system: str, history: list, question: str) -> list:
-    messages = [{"role": "system", "content": system}]
-    for entry in history:
-        messages.append({"role": "user", "content": entry["question"]})
-        messages.append({"role": "assistant", "content": entry["answer"]})
-    messages.append({"role": "user", "content": question})
-    return messages
-
-
-@bot.command(name="aiclean", aliases=["aireset", "aiclear", "ai_reset"])
-async def cmd_aiclean(ctx):
-    """Löscht das KI-Gedächtnis des Users."""
-    clear_history(ctx.author.id)
-    embed = discord.Embed(
-        title="🧹 KI-Gedächtnis gelöscht",
-        description=(
-            "🇩🇪 Dein Gesprächsverlauf wurde gelöscht. Die KI startet frisch!\n"
-            "🇫🇷 Ton historique a été effacé. L'IA repart à zéro!\n"
-            "🇬🇧 Your conversation history has been cleared. Fresh start!"
-        ),
-        color=0x2ECC71
-    )
-    embed.set_footer(text="VHA • KI-Gedächtnis", icon_url=LOGO_URL)
-    await ctx.send(embed=embed, delete_after=10)
-
-
 @bot.command(name="ai")
 @commands.cooldown(1, 12, commands.BucketType.user)
 async def cmd_ai(ctx, *, question: str = None):
@@ -895,43 +904,30 @@ async def cmd_ai(ctx, *, question: str = None):
     flag = LANG_FLAGS.get(lang, "🌐")
     footer = f"Antwort in {lang}"
 
-    history = load_history(ctx.author.id)
-
-    # Spezial-Modus: liebevoll-frecher Assistent für bestimmten User
-    is_special = _special_ai_mode and ctx.author.id == SPECIAL_USER_ID
-    system_prompt = SPECIAL_SYSTEM_PROMPT if is_special else (
+    system_prompt = (
         "Du bist ein freundlicher VHA-Alliance Assistent. "
         "Antworte IMMER in derselben Sprache wie die Frage. "
-        "Natürlich und direkt. "
-        "Du erinnerst dich an frühere Fragen des Users in diesem Gespräch."
+        "Natürlich und direkt."
     )
-    messages = build_messages(system_prompt, history, question.strip())
+    messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": question.strip()}]
 
     try:
         answer = await gemini_call_thinking(
             model=GEMINI_MODEL,
-            temperature=0.85 if is_special else 0.7,
+            temperature=0.7,
             max_tokens=1000,
             messages=messages
         )
-        color = 0xFF69B4 if is_special else 0x5865F2
-        history.append({"question": question.strip(), "answer": answer})
-        save_history(ctx.author.id, history)
+        color = 0x5865F2
     except Exception as e:
         answer = f"Fehler: {str(e)}"
         color = 0xFF0000
         footer = "Fehler"
 
-    title = f"💝 VHA KI • Antwort {flag}" if is_special else f"VHA KI • Antwort {flag}"
-    embed = discord.Embed(title=title, description=answer, color=color)
+    embed = discord.Embed(title=f"VHA KI • Antwort {flag}", description=answer, color=color)
     embed.set_author(name="VHA ALLIANCE", icon_url=LOGO_URL)
     embed.add_field(name="→ Deine Frage", value=question[:900], inline=False)
-    has_history = len(history) > 1
-    special_tag = " • 💝 Spezial-Modus" if is_special else ""
-    embed.set_footer(
-        text=f"VHA • Gemini • {GEMINI_MODEL} • {footer}" + (" • 🧠 Gedächtnis aktiv" if has_history else "") + special_tag,
-        icon_url=LOGO_URL
-    )
+    embed.set_footer(text=f"VHA • Gemini • {GEMINI_MODEL} • {footer}", icon_url=LOGO_URL)
     await thinking.edit(embed=embed)
 
 
@@ -954,43 +950,30 @@ async def cmd_aipm(ctx, *, question: str = None):
     flag = LANG_FLAGS.get(lang, "🌐")
     footer = f"Antwort in {lang}"
 
-    history = load_history(ctx.author.id)
-
-    # Spezial-Modus: liebevoll-frecher Assistent für bestimmten User
-    is_special = _special_ai_mode and ctx.author.id == SPECIAL_USER_ID
-    system_prompt = SPECIAL_SYSTEM_PROMPT if is_special else (
+    system_prompt = (
         "Du bist ein freundlicher VHA-Alliance Assistent. "
         "Antworte IMMER in derselben Sprache wie die Frage. "
-        "Natürlich und direkt. "
-        "Du erinnerst dich an frühere Fragen des Users in diesem Gespräch."
+        "Natürlich und direkt."
     )
-    messages = build_messages(system_prompt, history, question.strip())
+    messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": question.strip()}]
 
     try:
         answer = await gemini_call_thinking(
             model=GEMINI_MODEL,
-            temperature=0.85 if is_special else 0.7,
+            temperature=0.7,
             max_tokens=1000,
             messages=messages
         )
-        color = 0xFF69B4 if is_special else 0x5865F2
-        history.append({"question": question.strip(), "answer": answer})
-        save_history(ctx.author.id, history)
+        color = 0x5865F2
     except Exception as e:
         answer = f"Fehler: {str(e)}"
         color = 0xFF0000
         footer = "Fehler"
 
-    has_history = len(history) > 1
-    special_tag = " • 💝 Spezial-Modus" if is_special else ""
-    title = f"💝 VHA KI • Antwort {flag}" if is_special else f"VHA KI • Antwort {flag}"
-    embed = discord.Embed(title=title, description=answer, color=color)
+    embed = discord.Embed(title=f"VHA KI • Antwort {flag}", description=answer, color=color)
     embed.set_author(name="VHA ALLIANCE", icon_url=LOGO_URL)
     embed.add_field(name="→ Deine Frage", value=question[:900], inline=False)
-    embed.set_footer(
-        text=f"VHA • Gemini • {GEMINI_MODEL} • {footer} • Privat" + (" • 🧠 Gedächtnis aktiv" if has_history else "") + special_tag,
-        icon_url=LOGO_URL
-    )
+    embed.set_footer(text=f"VHA • Gemini • {GEMINI_MODEL} • {footer} • Privat", icon_url=LOGO_URL)
 
     try:
         await ctx.author.send(embed=embed)
@@ -1075,68 +1058,6 @@ async def cmd_kanalid(ctx):
 # ────────────────────────────────────────────────
 
 NOXXI_ID = 1464651603654086748
-
-# ────────────────────────────────────────────────
-# SPEZIAL-MODUS: Liebevoller Assistent für bestimmten User
-# ────────────────────────────────────────────────
-
-SPECIAL_USER_ID = 238610295893917697  # User der den speziellen Modus bekommt
-_special_ai_mode: bool = False  # An/Aus - nur Noxxi kann umschalten
-
-SPECIAL_SYSTEM_PROMPT = (
-    "Du bist ein freundlicher, aber frecher VHA-Alliance Assistent. "
-    "Du antwortest liebevoll — aber mit einem Augenzwinkern. "
-    "Wenn der User einen Fehler macht, korrigierst du ihn sanft, aber mit einem witzigen Spruch dazu. "
-    "Wenn er dich herausfordert oder provoziert, bist du schlagfertig und gibst ihm eine witzige, aber nette Antwort zurück. "
-    "Du bist nicht arrogant — du bist charmant frech. Denk an einen frechen besten Freund der es gut meint. "
-    "Antworte IMMER in derselben Sprache wie die Frage. "
-    "Du erinnerst dich an frühere Fragen des Users in diesem Gespräch."
-)
-
-
-@bot.command(name="specialmode", aliases=["smode", "liebesmode", "spezial"])
-async def cmd_specialmode(ctx, action: str = None):
-    """Schaltet den liebevoll-frechen Modus für den Spezial-User an/aus. Nur Noxxi."""
-    global _special_ai_mode
-
-    if ctx.author.id != NOXXI_ID:
-        await ctx.send("❌ Nur Noxxi kann diesen Befehl nutzen.", delete_after=5)
-        return
-
-    if action is None:
-        status = "✅ AN" if _special_ai_mode else "❌ AUS"
-        await ctx.send(
-            f"💝 Spezial-KI-Modus ist gerade: **{status}**\n"
-            f"`!specialmode on` / `!specialmode off`",
-            delete_after=10
-        )
-        return
-
-    action = action.lower()
-    if action == "on":
-        _special_ai_mode = True
-        embed = discord.Embed(
-            title="💝 Spezial-KI-Modus aktiviert",
-            description=(
-                "Der liebevoll-freche Modus ist jetzt **AN**.\n"
-                f"Gilt für User `{SPECIAL_USER_ID}`.\n"
-                "🎭 *Liebevoll • Frech • Schlagfertig*"
-            ),
-            color=0xFF69B4
-        )
-        embed.set_footer(text="VHA • Spezial-Modus", icon_url=LOGO_URL)
-        await ctx.send(embed=embed)
-    elif action == "off":
-        _special_ai_mode = False
-        embed = discord.Embed(
-            title="💝 Spezial-KI-Modus deaktiviert",
-            description="Der liebevoll-freche Modus ist jetzt **AUS**.",
-            color=0x808080
-        )
-        embed.set_footer(text="VHA • Spezial-Modus", icon_url=LOGO_URL)
-        await ctx.send(embed=embed)
-    else:
-        await ctx.send("`!specialmode on` / `!specialmode off`", delete_after=8)
 
 @bot.command(name="clean", aliases=["clear", "purge", "löschen"])
 async def cmd_clean(ctx, *args):
@@ -1277,7 +1198,15 @@ async def on_message(message: discord.Message):
     if channel_id == FORUM_CHANNEL_ID or parent_id == FORUM_CHANNEL_ID:
         return
 
-    # ── GIF & YOUTUBE SPERRE (nur ignorieren, keine API-Calls) ───────────────
+    # ── RAUM-SONDERKONFIGURATION: Groq-BOT übersetzt NICHT in diesen Raum ─────────────────────────────
+    _GROQ_DISABLED_ROOMS = {
+        1535662492364308480: set(),  # Keine Übersetzung für diesen Raum
+    }
+    if channel_id in _GROQ_DISABLED_ROOMS:
+        log.info(f"🚫 Groq Bot Übersetzer deaktiviert für Raum #{getattr(message.channel, 'name', channel_id)}")
+        return
+
+    # ── GIF & YOUTUBE SPERRE (nur ignorieren, keine API-Calls) ────────────────
     _SKIP_URL_PATTERN = re.compile(
         r'https?://\S*(?:tenor\.com|giphy\.com|youtube\.com|youtu\.be|youtube-nocookie\.com|yt\.be)\S*',
         re.IGNORECASE
