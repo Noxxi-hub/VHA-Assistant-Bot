@@ -151,25 +151,37 @@ async def on_ready():
         channel = bot.get_channel(BOT_LOG_CHANNEL_ID)
         if channel:
             if errors:
-                msg = "⚠️ **Bot gestartet mit Fehlern:**\n" + "\n".join(errors)
-            else:
-                msg = (
-                    "✅ **Bot erfolgreich gestartet!**\n"
-                    "🔧 koordinaten.py • geladen\n"
-                    "🔧 bilduebersetzer.py • geladen\n"
-                    "🔧 spieler.py • geladen\n"
-                    "🔧 log.py • geladen\n"
-                    "🔧 raumsprachen.py • geladen\n"
-                    "🔧 sprachen.py • geladen\n"
-                    "🔧 svs.py • geladen\n"
-                    "🔧 server.py • geladen\n"
-                    "🔧 gemini_core.py • geladen\n"
-                    "🔧 translate.py • geladen\n"
-                    "🔧 ai_commands.py • geladen\n"
-                    "🔧 commands.py • geladen\n"
-                    "🔧 flask_api.py • geladen"
+                embed = discord.Embed(
+                    title="⚠️ VHA Assistant Bot gestartet mit Fehlern:",
+                    description="\n".join(errors),
+                    color=0xED4245,
                 )
-            await channel.send(msg)
+            else:
+                embed = discord.Embed(
+                    title="✅ VHA Assistant Bot erfolgreich gestartet!",
+                    color=0x9B59B6,
+                )
+                embed.add_field(
+                    name="🔧 Module • geladen",
+                    value=(
+                        "🔧 koordinaten.py • geladen\n"
+                        "🔧 bilduebersetzer.py • geladen\n"
+                        "🔧 spieler.py • geladen\n"
+                        "🔧 log.py • geladen\n"
+                        "🔧 raumsprachen.py • geladen\n"
+                        "🔧 sprachen.py • geladen\n"
+                        "🔧 svs.py • geladen\n"
+                        "🔧 server.py • geladen\n"
+                        "🔧 gemini_core.py • geladen\n"
+                        "🔧 translate.py • geladen\n"
+                        "🔧 ai_commands.py • geladen\n"
+                        "🔧 commands.py • geladen\n"
+                        "🔧 flask_api.py • geladen"
+                    ),
+                    inline=False,
+                )
+            embed.set_footer(text=f"🤖 {bot.user} • Online")
+            await channel.send(embed=embed)
 
 
 # ────────────────────────────────────────────────
