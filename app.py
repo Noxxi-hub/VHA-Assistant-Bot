@@ -162,7 +162,12 @@ async def on_ready():
                     "🔧 raumsprachen.py • geladen\n"
                     "🔧 sprachen.py • geladen\n"
                     "🔧 svs.py • geladen\n"
-                    "🔧 server.py • geladen"
+                    "🔧 server.py • geladen\n"
+                    "🔧 gemini_core.py • geladen\n"
+                    "🔧 translate.py • geladen\n"
+                    "🔧 ai_commands.py • geladen\n"
+                    "🔧 commands.py • geladen\n"
+                    "🔧 flask_api.py • geladen"
                 )
             await channel.send(msg)
 
